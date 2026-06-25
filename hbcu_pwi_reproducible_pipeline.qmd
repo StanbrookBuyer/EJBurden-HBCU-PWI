@@ -1,0 +1,1351 @@
+---
+title: "HBCU vs PWI Environmental Justice Analysis: Full Reproducible Pipeline"
+subtitle: "Data acquisition, processing, and statistical analysis"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: show
+    code-summary: "Show code"
+    theme: flatly
+    fig-width: 10
+    fig-height: 6
+    embed-resources: true
+    df-print: kable
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+#  Notes
+
+This document provides a **complete, self-contained pipeline** for reproducing all results in:
+
+> Stanbrook, R. (in press). Environmental injustice in the shadow of the ivory tower: Cumulative EJ burden in communities surrounding Historically Black Colleges and Universities compared to primarily-white institutions.
+
+The pipeline is structured in three parts:
+
+1.  **Data Acquisition** — queries the EPA EJScreen ArcGIS REST API to retrieve EJ indicator values for campus communities, following the same 1-mile buffer / population-weighted aggregation approach used in the published analysis.
+2.  **Data Processing** — tidies raw API output into the analysis-ready wide format CSVs archived in this repository.
+3.  **Statistical Analysis** — reproduces all descriptive statistics, figures, and inferential tests reported in the paper.
+
+## Using the archived data (recommended for exact replication)
+
+The Dryad repository includes pre-computed, analysis-ready CSV files:
+
+| File               | Contents                                        |
+|--------------------|-------------------------------------------------|
+| `hbcu_list.csv`    | HBCU campus centroids and metadata (n = 87)     |
+| `pwi_list.csv`     | PWI campus centroids and metadata (n = 86)      |
+| `hbcu_ej_wide.csv` | HBCU EJScreen EJ Index percentiles, wide format |
+| `pwi_ej_wide.csv`  | PWI EJScreen EJ Index percentiles, wide format  |
+
+To reproduce all **analysis results exactly**, set `USE_ARCHIVED_DATA <- TRUE` in the chunk below and ensure the four CSV files are in your working directory.
+
+```{r global-config}
+# ── SET THIS FLAG ──────────────────────────────────────────────────────────────
+# TRUE  → skip API fetch; load archived CSVs from the repository deposit
+# FALSE → re-fetch from the live EJScreen API (requires internet access)
+USE_ARCHIVED_DATA <- TRUE
+
+# EJScreen service version used in the published analysis
+EJSCREEN_VERSION <- "EJScreen_2.2_with_AS_CNMI_GU_VI"
+
+# Buffer radius in metres (1 US mile)
+BUFFER_M <- 1609
+
+# Set a seed for all bootstrapped CIs (must match published analysis)
+RANDOM_SEED <- 42
+```
+
+------------------------------------------------------------------------
+
+# Setup
+
+## Required packages
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(tidyverse)   # data wrangling and visualisation
+  library(httr)        # HTTP requests to EJScreen API
+  library(jsonlite)    # JSON parsing
+  library(sf)          # spatial operations
+  library(tigris)      # US state boundaries for maps
+  library(leaflet)     # interactive maps
+  library(MatchIt)     # propensity-score matching
+  library(broom)       # tidy model output
+  library(scales)      # axis formatting
+  library(gt)          # publication-quality tables
+  library(ggridges)    # ridgeline density plots
+  library(ggrepel)     # non-overlapping map labels
+  library(car)         # Levene's test
+  library(readr)       # CSV I/O
+  library(dplyr)
+  library(stringr)
+})
+
+# car::recode masks dplyr::recode — restore dplyr's version
+recode <- dplyr::recode
+
+# Global ggplot theme
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title    = element_text(face = "bold"),
+      plot.subtitle = element_text(colour = "grey40"),
+      panel.grid.minor = element_blank()
+    )
+)
+```
+
+To install all required packages from scratch:
+
+``` r
+install.packages(c(
+  "tidyverse", "httr", "jsonlite", "sf", "tigris", "leaflet",
+  "MatchIt", "broom", "scales", "gt", "ggridges", "ggrepel",
+  "car", "readr", "dplyr", "stringr"
+))
+```
+
+R version used in published analysis: **R 4.5.1**
+
+------------------------------------------------------------------------
+
+# Part 1: Data Acquisition
+
+> Skip to [Part 2](#part-2-data-processing) if `USE_ARCHIVED_DATA = TRUE`.
+
+## 1.1 Institution lists
+
+### HBCU list
+
+The HBCU institution list was compiled from a curated institutional dataset (`HBCU-DATA2.0.csv`) and cross-validated against federal Title III designation records. The raw file is included in the repository as `HBCU-DATA2.0.csv`. The code below replicates the cleaning applied by `scripts/prepare_hbcu_list.R`.
+
+```{r prepare-hbcu-list, eval=!USE_ARCHIVED_DATA}
+raw_hbcu <- readr::read_csv(
+  "HBCU-DATA2.0.csv",
+  col_names = c("school", "Location", "Latitude", "Longitude", "year_founded"),
+  skip = 1,
+  show_col_types = FALSE,
+  trim_ws = TRUE
+)
+
+hbcu_list <- raw_hbcu |>
+  # Drop empty rows
+  dplyr::filter(!is.na(school), school != "") |>
+  # Clean school names
+  dplyr::mutate(
+    school = stringr::str_remove_all(school, '"') |> stringr::str_squish()
+  ) |>
+  # Coerce coordinates; US longitudes must be negative
+  dplyr::mutate(
+    Latitude  = as.numeric(Latitude),
+    Longitude = as.numeric(Longitude),
+    Longitude = dplyr::if_else(Longitude > 0, -Longitude, Longitude)
+  ) |>
+  # Remove records outside US/territory bounding box
+  dplyr::filter(
+    !is.na(Latitude),  Latitude  >= 15, Latitude  <= 72,
+    !is.na(Longitude), Longitude <= -60, Longitude >= -180
+  ) |>
+  # Parse founding year
+  dplyr::mutate(
+    year_founded = as.integer(stringr::str_extract(
+      as.character(year_founded), "\\d{4}"
+    )),
+    Location = stringr::str_squish(Location)
+  ) |>
+  dplyr::select(school, Latitude, Longitude, Location, year_founded) |>
+  dplyr::arrange(school)
+
+message(sprintf("HBCU list: %d institutions", nrow(hbcu_list)))
+```
+
+### PWI list
+
+The PWI comparison group was assembled manually from publicly available federal data. Selection criteria: (i) four-year, degree-granting, accredited institutions classified as primarily-white under federal Title III definitions; (ii) located in a state also represented in the HBCU sample; (iii) comparable undergraduate enrollment; (iv) no specialist mission (military academies, seminaries excluded). The curated list is archived as `pwi_list.csv`.
+
+```{r load-pwi-list, eval=!USE_ARCHIVED_DATA}
+# pwi_list.csv is manually curated — load directly
+pwi_list <- readr::read_csv("pwi_list.csv", show_col_types = FALSE)
+message(sprintf("PWI list: %d institutions", nrow(pwi_list)))
+```
+
+## 1.2 EJScreen API helper functions
+
+EJ burden data are retrieved from the EPA EJScreen ArcGIS Online FeatureServer. For each institution a spatial query is submitted using the campus centroid coordinates and a 1-mile (1,609 m) circular buffer. All census block groups whose boundaries intersect the buffer are returned.
+
+```{r ejscreen-helpers, eval=!USE_ARCHIVED_DATA}
+# ── EJScreen ArcGIS REST endpoint ─────────────────────────────────────────────
+EJSCREEN_URL <- paste0(
+  "https://services.arcgis.com/cJ9YHowT8TU7DUyn/ArcGIS/rest/services/",
+  EJSCREEN_VERSION,
+  "/FeatureServer/1/query"
+)
+
+# EJ Summary Index national (USA) percentile field names in EJScreen 2.2
+# These are the raw API field names; they are renamed to descriptive labels
+# in the processing step below.
+EJ_FIELDS <- c(
+  "P_EJDPM25SUP",  # Particulate Matter (PM2.5) EJ Index
+  "P_EJOZONESUP",  # Ozone EJ Index
+  "P_EJNO2SUP",    # Nitrogen Dioxide (NO2) EJ Index
+  "P_EJDSLPMSUP",  # Diesel Particulate Matter EJ Index
+  "P_EJCANCR",     # Toxic Releases to Air (Air Toxics Cancer Risk) EJ Index
+  "P_EJPTRAF",     # Traffic Proximity and Volume EJ Index
+  "P_EJLDPNT",     # Lead Paint EJ Index
+  "P_EJPNPL",      # Superfund Proximity EJ Index
+  "P_EJPRMP",      # RMP Facility Proximity EJ Index
+  "P_EJPTSDF",     # Hazardous Waste Proximity EJ Index
+  "P_EJUST",       # Underground Storage Tanks EJ Index
+  "P_EJPWDIS",     # Wastewater Discharge EJ Index
+  "P_EJDWATERNC",  # Drinking Water Non-Compliance EJ Index
+  "ACSTOTPOP"      # Total resident population (for population weighting)
+)
+
+# Human-readable names used in all analyses — must match pu_vars in Part 3
+EJ_LABELS <- c(
+  "P_EJDPM25SUP"  = "Particulate Matter Summary Index_pct_usa",
+  "P_EJOZONESUP"  = "Ozone Summary Index_pct_usa",
+  "P_EJNO2SUP"    = "Nitrogen Dioxide (NO2) Summary Index_pct_usa",
+  "P_EJDSLPMSUP"  = "Diesel Particulate Matter Summary Index_pct_usa",
+  "P_EJCANCR"     = "Toxic Releases to Air Summary Index_pct_usa",
+  "P_EJPTRAF"     = "Traffic Proximity and Volume Summary Index_pct_usa",
+  "P_EJLDPNT"     = "Lead Paint Summary Index_pct_usa",
+  "P_EJPNPL"      = "Superfund Proximity Summary Index_pct_usa",
+  "P_EJPRMP"      = "RMP Proximity Summary Index_pct_usa",
+  "P_EJPTSDF"     = "Hazardous Waste Proximity Summary Index_pct_usa",
+  "P_EJUST"       = "Underground Storage Tanks Summary Index_pct_usa",
+  "P_EJPWDIS"     = "Wastewater Discharge Summary Index_pct_usa",
+  "P_EJDWATERNC"  = "Drinking Water Non-Compliance Summary Index_pct_usa"
+)
+
+# ── Core fetch function ────────────────────────────────────────────────────────
+# Queries EJScreen for a single campus centroid, returns raw block-group rows.
+fetch_ejscreen_campus <- function(school_name, lat, lon,
+                                  buffer_m = BUFFER_M,
+                                  max_retries = 3,
+                                  pause_s = 1.5) {
+  out_fields <- paste(EJ_FIELDS, collapse = ",")
+
+  params <- list(
+    geometry     = paste0(lon, ",", lat),
+    geometryType = "esriGeometryPoint",
+    inSR         = "4326",
+    spatialRel   = "esriSpatialRelIntersects",
+    distance     = buffer_m,
+    units        = "esriSRUnit_Meter",
+    outFields    = out_fields,
+    returnGeometry = "false",
+    f            = "json"
+  )
+
+  for (attempt in seq_len(max_retries)) {
+    resp <- tryCatch(
+      httr::GET(EJSCREEN_URL, query = params, httr::timeout(60)),
+      error = function(e) NULL
+    )
+
+    if (!is.null(resp) && httr::status_code(resp) == 200) {
+      body <- httr::content(resp, as = "text", encoding = "UTF-8")
+      parsed <- jsonlite::fromJSON(body, simplifyDataFrame = TRUE)
+
+      if (!is.null(parsed$features) && nrow(parsed$features) > 0) {
+        attrs <- parsed$features$attributes
+        attrs$school <- school_name
+        Sys.sleep(pause_s)
+        return(attrs)
+      } else {
+        # No intersecting block groups found — return empty row
+        empty <- as.data.frame(
+          setNames(
+            as.list(rep(NA_real_, length(EJ_FIELDS))),
+            EJ_FIELDS
+          )
+        )
+        empty$school <- school_name
+        return(empty)
+      }
+    }
+
+    Sys.sleep(pause_s * attempt)
+  }
+
+  warning(sprintf("Failed to fetch data for: %s", school_name))
+  return(NULL)
+}
+```
+
+## 1.3 Fetch EJScreen data for all institutions
+
+```{r fetch-hbcu, eval=!USE_ARCHIVED_DATA}
+message("Fetching EJScreen data for HBCUs (this may take ~10 minutes)...")
+
+hbcu_raw_list <- purrr::map2(
+  hbcu_list$school,
+  hbcu_list |> select(Latitude, Longitude) |> transpose(),
+  function(school, coords) {
+    fetch_ejscreen_campus(school, coords$Latitude, coords$Longitude)
+  }
+)
+
+hbcu_ejscreen_raw <- dplyr::bind_rows(
+  purrr::compact(hbcu_raw_list)
+)
+
+readr::write_csv(hbcu_ejscreen_raw, "hbcu_ejscreen_raw.csv")
+message(sprintf("Fetched %d block-group rows for %d HBCU campuses",
+                nrow(hbcu_ejscreen_raw),
+                n_distinct(hbcu_ejscreen_raw$school)))
+```
+
+```{r fetch-pwi, eval=!USE_ARCHIVED_DATA}
+message("Fetching EJScreen data for PWIs (this may take ~10 minutes)...")
+
+pwi_raw_list <- purrr::map2(
+  pwi_list$school,
+  pwi_list |> select(Latitude, Longitude) |> transpose(),
+  function(school, coords) {
+    fetch_ejscreen_campus(school, coords$Latitude, coords$Longitude)
+  }
+)
+
+pwi_ejscreen_raw <- dplyr::bind_rows(
+  purrr::compact(pwi_raw_list)
+)
+
+readr::write_csv(pwi_ejscreen_raw, "pwi_ejscreen_raw.csv")
+message(sprintf("Fetched %d block-group rows for %d PWI campuses",
+                nrow(pwi_ejscreen_raw),
+                n_distinct(pwi_ejscreen_raw$school)))
+```
+
+------------------------------------------------------------------------
+
+# Part 2: Data Processing {#part-2-data-processing}
+
+## 2.1 Population-weighted aggregation
+
+For each campus, EJ index percentile values from all intersecting block groups are aggregated to a single campus-level estimate using a **population-weighted mean** (weighted by `ACSTOTPOP`, the resident population of each block group). Block groups with zero or missing population are excluded from the weighting but contribute a simple mean if no populated block groups exist.
+
+```{r aggregate-function, eval=!USE_ARCHIVED_DATA}
+# Computes the population-weighted mean of EJ indicators across block groups
+# for a single campus.
+aggregate_campus <- function(df_campus) {
+  ej_cols <- names(EJ_LABELS)  # the 13 raw API field names
+
+  pop <- df_campus$ACSTOTPOP
+  pop[is.na(pop) | pop < 0] <- 0
+  total_pop <- sum(pop)
+
+  if (total_pop == 0) {
+    # No populated block groups — fall back to simple mean
+    result <- df_campus |>
+      summarise(across(all_of(ej_cols), ~ mean(.x, na.rm = TRUE)))
+  } else {
+    result <- df_campus |>
+      summarise(across(
+        all_of(ej_cols),
+        ~ weighted.mean(.x, w = pop, na.rm = TRUE)
+      ))
+  }
+
+  result
+}
+```
+
+```{r process-hbcu, eval=!USE_ARCHIVED_DATA}
+hbcu_ejscreen_raw <- readr::read_csv("hbcu_ejscreen_raw.csv",
+                                     show_col_types = FALSE)
+
+hbcu_ej_wide <- hbcu_ejscreen_raw |>
+  dplyr::group_by(school) |>
+  dplyr::group_modify(~ aggregate_campus(.x)) |>
+  dplyr::ungroup() |>
+  # Rename API field names to descriptive labels used throughout analysis
+  dplyr::rename(!!!EJ_LABELS) |>
+  # Join metadata from institution list
+  dplyr::left_join(
+    hbcu_list |> select(school, Latitude, Longitude, Location, year_founded),
+    by = "school"
+  )
+
+readr::write_csv(hbcu_ej_wide, "hbcu_ej_wide.csv")
+message(sprintf("hbcu_ej_wide.csv written: %d rows", nrow(hbcu_ej_wide)))
+```
+
+```{r process-pwi, eval=!USE_ARCHIVED_DATA}
+pwi_ejscreen_raw <- readr::read_csv("pwi_ejscreen_raw.csv",
+                                    show_col_types = FALSE)
+
+pwi_ej_wide <- pwi_ejscreen_raw |>
+  dplyr::group_by(school) |>
+  dplyr::group_modify(~ aggregate_campus(.x)) |>
+  dplyr::ungroup() |>
+  dplyr::rename(!!!EJ_LABELS) |>
+  dplyr::left_join(
+    pwi_list |> select(school, Latitude, Longitude, Location, year_founded),
+    by = "school"
+  )
+
+readr::write_csv(pwi_ej_wide, "pwi_ej_wide.csv")
+message(sprintf("pwi_ej_wide.csv written: %d rows", nrow(pwi_ej_wide)))
+```
+
+------------------------------------------------------------------------
+
+# Part 3: Statistical Analysis
+
+## 3.1 Load analysis-ready data
+
+```{r load-data}
+ej_hbcu <- readr::read_csv("hbcu_ej_wide.csv", show_col_types = FALSE)
+ej_pwi  <- readr::read_csv("pwi_ej_wide.csv",  show_col_types = FALSE)
+```
+
+## 3.2 Variable definitions
+
+```{r variable-defs}
+# The 13 EJ Summary Index national (USA) percentile columns
+pu_vars <- c(
+  "Particulate Matter Summary Index_pct_usa",
+  "Ozone Summary Index_pct_usa",
+  "Nitrogen Dioxide (NO2) Summary Index_pct_usa",
+  "Diesel Particulate Matter Summary Index_pct_usa",
+  "Toxic Releases to Air Summary Index_pct_usa",
+  "Traffic Proximity and Volume Summary Index_pct_usa",
+  "Lead Paint Summary Index_pct_usa",
+  "Superfund Proximity Summary Index_pct_usa",
+  "RMP Proximity Summary Index_pct_usa",
+  "Hazardous Waste Proximity Summary Index_pct_usa",
+  "Underground Storage Tanks Summary Index_pct_usa",
+  "Wastewater Discharge Summary Index_pct_usa",
+  "Drinking Water Non-Compliance Summary Index_pct_usa"
+)
+
+# Short display labels for figures
+indicator_labels <- c(
+  "Particulate Matter Summary Index_pct_usa"          = "PM 2.5",
+  "Ozone Summary Index_pct_usa"                       = "Ozone",
+  "Nitrogen Dioxide (NO2) Summary Index_pct_usa"      = "NO₂",
+  "Diesel Particulate Matter Summary Index_pct_usa"   = "Diesel PM",
+  "Toxic Releases to Air Summary Index_pct_usa"       = "Toxic Air",
+  "Traffic Proximity and Volume Summary Index_pct_usa"= "Traffic",
+  "Lead Paint Summary Index_pct_usa"                  = "Lead Paint",
+  "Superfund Proximity Summary Index_pct_usa"         = "Superfund",
+  "RMP Proximity Summary Index_pct_usa"               = "RMP",
+  "Hazardous Waste Proximity Summary Index_pct_usa"   = "Hazardous Waste",
+  "Underground Storage Tanks Summary Index_pct_usa"   = "UST",
+  "Wastewater Discharge Summary Index_pct_usa"        = "Wastewater",
+  "Drinking Water Non-Compliance Summary Index_pct_usa" = "Drinking Water"
+)
+```
+
+## 3.3 Harmonise and combine
+
+```{r harmonise}
+hbcu_scores <- ej_hbcu |>
+  mutate(
+    burden_score = rowMeans(across(all_of(pu_vars)), na.rm = TRUE),
+    group        = "HBCU",
+    year_founded = as.integer(year_founded)
+  )
+
+pwi_scores <- ej_pwi |>
+  mutate(
+    burden_score = rowMeans(across(all_of(pu_vars)), na.rm = TRUE),
+    group        = "PWI",
+    year_founded = as.integer(year_founded)
+  )
+
+combined <- bind_rows(hbcu_scores, pwi_scores) |>
+  mutate(
+    state_abbr = str_extract(Location, "[A-Z]{2}(?=[^A-Za-z]*$)"),
+    region = case_when(
+      state_abbr %in% c("CT","ME","MA","NH","NJ","NY","PA","RI","VT",
+                        "MD","DE","DC")                              ~ "Northeast",
+      state_abbr %in% c("AL","AR","FL","GA","KY","LA","MS","NC","OK",
+                        "SC","TN","TX","VA","WV")                   ~ "South",
+      state_abbr %in% c("IL","IN","IA","KS","MI","MN","MO","NE",
+                        "ND","OH","SD","WI")                        ~ "Midwest",
+      state_abbr %in% c("AK","AZ","CA","CO","HI","ID","MT","NV",
+                        "NM","OR","UT","WA","WY")                   ~ "West",
+      TRUE                                                           ~ "Other"
+    )
+  )
+
+tibble(
+  Group              = c("HBCU", "PWI"),
+  N                  = c(nrow(hbcu_scores), nrow(pwi_scores)),
+  `NA in burden_score` = c(
+    sum(is.na(hbcu_scores$burden_score)),
+    sum(is.na(pwi_scores$burden_score))
+  )
+) |>
+  gt() |>
+  tab_header(title = "Dataset summary after harmonisation")
+```
+
+------------------------------------------------------------------------
+
+# 4 Descriptive Statistics
+
+## 4.1 Summary statistics by group
+
+```{r desc-table}
+combined |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  group_by(group, indicator) |>
+  summarise(
+    N      = sum(!is.na(value)),
+    Median = round(median(value, na.rm = TRUE), 1),
+    Mean   = round(mean(value, na.rm = TRUE), 1),
+    pct80  = round(mean(value >= 80, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) |>
+  mutate(indicator = recode(indicator, !!!indicator_labels)) |>
+  pivot_wider(
+    names_from  = group,
+    values_from = c(N, Median, Mean, pct80),
+    names_glue  = "{group}_{.value}"
+  ) |>
+  arrange(indicator) |>
+  gt() |>
+  tab_header(
+    title    = "EJ Summary Index USA percentiles: HBCU vs PWI",
+    subtitle = "All institutions (pre-matching)"
+  ) |>
+  tab_spanner(label = "HBCU", columns = starts_with("HBCU")) |>
+  tab_spanner(label = "PWI",  columns = starts_with("PWI"))  |>
+  cols_label(
+    indicator   = "Indicator",
+    HBCU_N = "N", HBCU_Median = "Median", HBCU_Mean = "Mean", HBCU_pct80 = "% ≥ 80",
+    PWI_N  = "N", PWI_Median  = "Median", PWI_Mean  = "Mean", PWI_pct80  = "% ≥ 80"
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fde0dd"),
+    locations = cells_body(columns = HBCU_pct80, rows = HBCU_pct80 > 50)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#dbeafe"),
+    locations = cells_body(columns = PWI_pct80, rows = PWI_pct80 > 50)
+  ) |>
+  tab_footnote(
+    footnote  = "Red = > 50% of schools exceed the 80th national percentile.",
+    locations = cells_column_labels(columns = HBCU_pct80)
+  )
+```
+
+## 4.2 Indicator distributions
+
+```{r violin-indicators, fig.height=10}
+combined |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  mutate(
+    indicator = recode(indicator, !!!indicator_labels),
+    group     = factor(group, levels = c("HBCU", "PWI"))
+  ) |>
+  ggplot(aes(x = group, y = value, fill = group)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 0.8) +
+  geom_hline(yintercept = 50, linetype = "dashed",  colour = "grey50") +
+  geom_hline(yintercept = 80, linetype = "dotted",  colour = "#E15759") +
+  facet_wrap(~indicator, ncol = 4) +
+  scale_fill_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), guide = "none"
+  ) +
+  labs(
+    title    = "EJ Index USA percentile distributions: HBCU vs PWI",
+    subtitle = "Dashed = 50th | dotted red = 80th national percentile",
+    x = NULL, y = "USA percentile"
+  )
+```
+
+------------------------------------------------------------------------
+
+# 5 Testing Against the National Median
+
+## 5.1 Normality (Shapiro–Wilk)
+
+```{r normality}
+combined |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  group_by(group, indicator) |>
+  summarise(
+    W      = round(shapiro.test(na.omit(value))$statistic, 4),
+    p      = round(shapiro.test(na.omit(value))$p.value, 4),
+    normal = if_else(p > 0.05, "✓ Normal", "✗ Non-normal"),
+    .groups = "drop"
+  ) |>
+  mutate(indicator = recode(indicator, !!!indicator_labels)) |>
+  pivot_wider(
+    names_from  = group,
+    values_from = c(W, p, normal),
+    names_glue  = "{group}_{.value}"
+  ) |>
+  gt() |>
+  tab_header(
+    title    = "Shapiro–Wilk normality tests by group",
+    subtitle = "H₀: data are normally distributed"
+  ) |>
+  tab_spanner(label = "HBCU", columns = starts_with("HBCU")) |>
+  tab_spanner(label = "PWI",  columns = starts_with("PWI"))  |>
+  cols_label(
+    indicator    = "Indicator",
+    HBCU_W = "W", HBCU_p = "p", HBCU_normal = "Normality?",
+    PWI_W  = "W", PWI_p  = "p", PWI_normal  = "Normality?"
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fee8c8"),
+    locations = cells_body(
+      columns = c(HBCU_normal, PWI_normal),
+      rows    = HBCU_normal == "✗ Non-normal" | PWI_normal == "✗ Non-normal"
+    )
+  )
+```
+
+## 5.2 One-sample Wilcoxon tests (H₁: median \> 50)
+
+```{r one-sample-tests}
+one_sample <- combined |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  group_by(group, indicator) |>
+  summarise(
+    n      = sum(!is.na(value)),
+    median = round(median(value, na.rm = TRUE), 1),
+    W      = round(wilcox.test(na.omit(value), mu = 50,
+                               alternative = "greater")$statistic, 1),
+    p      = round(wilcox.test(na.omit(value), mu = 50,
+                               alternative = "greater")$p.value, 4),
+    .groups = "drop"
+  ) |>
+  mutate(
+    sig       = case_when(
+      p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "ns"
+    ),
+    indicator = recode(indicator, !!!indicator_labels)
+  ) |>
+  pivot_wider(
+    names_from  = group,
+    values_from = c(n, median, W, p, sig),
+    names_glue  = "{group}_{.value}"
+  )
+
+one_sample |>
+  gt() |>
+  tab_header(
+    title    = "One-sample Wilcoxon tests vs. national median (μ = 50)",
+    subtitle = "H₁: campus communities have above-median EJ burden nationally"
+  ) |>
+  tab_spanner(label = "HBCU", columns = starts_with("HBCU")) |>
+  tab_spanner(label = "PWI",  columns = starts_with("PWI"))  |>
+  cols_label(
+    indicator   = "Indicator",
+    HBCU_n = "N", HBCU_median = "Median", HBCU_W = "W",
+    HBCU_p = "p", HBCU_sig = "",
+    PWI_n  = "N", PWI_median  = "Median", PWI_W  = "W",
+    PWI_p  = "p", PWI_sig  = ""
+  ) |>
+  tab_footnote(
+    footnote  = "* p < 0.05  ** p < 0.01  *** p < 0.001 (one-sided, H₁: median > 50)",
+    locations = cells_column_labels(columns = HBCU_sig)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fde0dd"),
+    locations = cells_body(columns = HBCU_p, rows = HBCU_p < 0.05)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#dbeafe"),
+    locations = cells_body(columns = PWI_p, rows = PWI_p < 0.05)
+  )
+```
+
+## 5.3 Forest plot: median percentiles with bootstrapped 95% CIs
+
+```{r forest-plot, fig.height=7}
+set.seed(RANDOM_SEED)
+ci_both <- combined |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  group_by(group, indicator) |>
+  summarise(
+    median = median(value, na.rm = TRUE),
+    lo = quantile(
+      replicate(2000, median(sample(na.omit(value), replace = TRUE))), 0.025
+    ),
+    hi = quantile(
+      replicate(2000, median(sample(na.omit(value), replace = TRUE))), 0.975
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    indicator = recode(indicator, !!!indicator_labels),
+    group     = factor(group, levels = c("HBCU", "PWI"))
+  )
+
+ggplot(ci_both, aes(x = median, y = reorder(indicator, median),
+                    colour = group)) +
+  geom_vline(xintercept = 50, linetype = "dashed",
+             colour = "grey50", linewidth = 0.7) +
+  geom_vline(xintercept = 80, linetype = "dotted",
+             colour = "#E15759", linewidth = 0.7) +
+  geom_errorbarh(
+    aes(xmin = lo, xmax = hi), height = 0.3,
+    position = position_dodge(0.6)
+  ) +
+  geom_point(size = 3, position = position_dodge(0.6)) +
+  scale_colour_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), name = NULL
+  ) +
+  scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+  labs(
+    title    = "Median EJ Index (USA percentile): HBCU vs PWI",
+    subtitle = "Bootstrapped 95% CIs (2,000 replicates) | seed = 42",
+    x = "USA percentile", y = NULL
+  )
+```
+
+------------------------------------------------------------------------
+
+# 6 EPA 80th-Percentile Threshold
+
+```{r pct-80-chart, fig.height=6}
+hbcu_pct <- hbcu_scores |>
+  select(all_of(pu_vars)) |>
+  pivot_longer(everything()) |>
+  group_by(name) |>
+  summarise(hbcu_pct80 = mean(value >= 80, na.rm = TRUE) * 100)
+
+pwi_pct <- pwi_scores |>
+  select(all_of(pu_vars)) |>
+  pivot_longer(everything()) |>
+  group_by(name) |>
+  summarise(pwi_pct80 = mean(value >= 80, na.rm = TRUE) * 100)
+
+pct_compare <- left_join(hbcu_pct, pwi_pct, by = "name") |>
+  mutate(indicator = recode(name, !!!indicator_labels))
+
+pct_compare |>
+  pivot_longer(c(hbcu_pct80, pwi_pct80), names_to = "group",
+               values_to = "pct") |>
+  mutate(
+    pct   = if_else(group == "pwi_pct80", -pct, pct),
+    group = factor(group,
+                   levels = c("hbcu_pct80", "pwi_pct80"),
+                   labels = c("HBCU", "PWI"))
+  ) |>
+  ggplot(aes(x = pct, y = reorder(indicator, abs(pct)), fill = group)) +
+  geom_col(alpha = 0.7) +
+  scale_fill_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), name = NULL
+  ) +
+  scale_x_continuous(labels = abs) +
+  labs(
+    title    = "Percent of institutions ≥ 80th national percentile",
+    subtitle = "HBCU (right) vs PWI (left)",
+    x = "% institutions", y = NULL
+  )
+```
+
+------------------------------------------------------------------------
+
+# 7 Cumulative Burden Score
+
+```{r burden-summary}
+combined |>
+  group_by(group) |>
+  summarise(
+    N       = n(),
+    Min     = round(min(burden_score,               na.rm = TRUE), 1),
+    Q1      = round(quantile(burden_score, .25,     na.rm = TRUE), 1),
+    Median  = round(median(burden_score,            na.rm = TRUE), 1),
+    Mean    = round(mean(burden_score,              na.rm = TRUE), 1),
+    Q3      = round(quantile(burden_score, .75,     na.rm = TRUE), 1),
+    Max     = round(max(burden_score,               na.rm = TRUE), 1),
+    `% >= 70` = round(mean(burden_score >= 70,      na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  tab_header(
+    title    = "Cumulative EJ burden score by group",
+    subtitle = "Mean of 13 EJ Summary Index USA percentiles"
+  )
+```
+
+```{r burden-violin-all, fig.height=5}
+ggplot(combined, aes(x = group, y = burden_score, fill = group)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 1.5) +
+  stat_summary(fun = median, geom = "point", shape = 23, size = 3,
+               fill = "white") +
+  geom_hline(yintercept = 50, linetype = "dashed", colour = "grey50") +
+  scale_fill_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), guide = "none"
+  ) +
+  labs(
+    title    = "Cumulative EJ burden score: HBCU vs PWI (all institutions)",
+    subtitle = "Dashed = national median (50th percentile)",
+    x = NULL, y = "Mean EJ Index USA percentile"
+  )
+```
+
+------------------------------------------------------------------------
+
+# 8 Propensity-Score Matching
+
+1:1 nearest-neighbour matching on Census region and founding year. Ensures HBCU and PWI groups are comparable on key observable confounders before inferential comparison.
+
+```{r matching}
+match_df <- combined |>
+  filter(!is.na(region), !is.na(year_founded)) |>
+  mutate(treat = if_else(group == "HBCU", 1L, 0L))
+
+set.seed(RANDOM_SEED)
+m.out <- matchit(
+  treat ~ region + year_founded,
+  data   = match_df,
+  method = "nearest",
+  ratio  = 1
+)
+
+matched <- match.data(m.out)
+
+summary(m.out)
+```
+
+```{r burden-violin-matched, fig.height=5}
+wilcox_res <- wilcox.test(burden_score ~ group, data = matched)
+
+matched |>
+  mutate(group = factor(group, levels = c("HBCU", "PWI"))) |>
+  ggplot(aes(x = group, y = burden_score, fill = group)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 1.5) +
+  stat_summary(fun = median, geom = "point", shape = 23, size = 3,
+               fill = "white") +
+  geom_hline(yintercept = 50, linetype = "dashed", colour = "grey50") +
+  scale_fill_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), guide = "none"
+  ) +
+  labs(
+    title    = "Cumulative EJ burden: HBCU vs matched PWI",
+    subtitle = paste0(
+      "Two-sample Wilcoxon: W = ", wilcox_res$statistic,
+      ",  p = ", formatC(wilcox_res$p.value, format = "e", digits = 2)
+    ),
+    x = NULL, y = "Mean EJ Index USA percentile"
+  )
+```
+
+------------------------------------------------------------------------
+
+# 9 Indicator-Level Comparison (Matched Sample)
+
+```{r indicator-tests}
+indicator_tests <- matched |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  group_by(indicator) |>
+  summarise(
+    HBCU_median = round(median(value[group == "HBCU"], na.rm = TRUE), 1),
+    PWI_median  = round(median(value[group == "PWI"],  na.rm = TRUE), 1),
+    difference  = round(HBCU_median - PWI_median, 1),
+    W           = round(wilcox.test(value[group == "HBCU"],
+                                    value[group == "PWI"])$statistic, 1),
+    p           = round(wilcox.test(value[group == "HBCU"],
+                                    value[group == "PWI"])$p.value, 4),
+    .groups     = "drop"
+  ) |>
+  mutate(
+    sig       = case_when(
+      p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "ns"
+    ),
+    indicator = recode(indicator, !!!indicator_labels)
+  ) |>
+  arrange(p)
+
+indicator_tests |>
+  gt() |>
+  tab_header(
+    title    = "Two-sample Wilcoxon tests per indicator (matched sample)",
+    subtitle = "H₁: HBCU campus communities differ from matched PWI communities"
+  ) |>
+  cols_label(
+    indicator   = "Indicator",
+    HBCU_median = "HBCU Median",
+    PWI_median  = "PWI Median",
+    difference  = "Difference",
+    W = "W", p = "p-value", sig = ""
+  ) |>
+  tab_footnote(
+    footnote  = "Positive difference = HBCU median exceeds PWI median. * p<0.05  ** p<0.01  *** p<0.001",
+    locations = cells_column_labels(columns = sig)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fde0dd"),
+    locations = cells_body(rows = p < 0.05)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fee8c8"),
+    locations = cells_body(rows = p >= 0.05 & p < 0.10)
+  )
+```
+
+```{r indicator-forest, fig.height=7}
+set.seed(RANDOM_SEED)
+indicator_ci_df <- matched |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  group_by(group, indicator) |>
+  summarise(
+    median = median(value, na.rm = TRUE),
+    lo = quantile(
+      replicate(2000, median(sample(na.omit(value), replace = TRUE))), 0.025
+    ),
+    hi = quantile(
+      replicate(2000, median(sample(na.omit(value), replace = TRUE))), 0.975
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    indicator = recode(indicator, !!!indicator_labels),
+    group     = factor(group, levels = c("HBCU", "PWI"))
+  )
+
+ggplot(indicator_ci_df,
+       aes(x = median, y = reorder(indicator, median), colour = group)) +
+  geom_vline(xintercept = 50, linetype = "dashed",
+             colour = "grey50", linewidth = 0.7) +
+  geom_vline(xintercept = 80, linetype = "dotted",
+             colour = "#E15759", linewidth = 0.7) +
+  geom_errorbarh(
+    aes(xmin = lo, xmax = hi), height = 0.3,
+    position = position_dodge(0.6)
+  ) +
+  geom_point(size = 3, position = position_dodge(0.6)) +
+  scale_colour_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), name = NULL
+  ) +
+  scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+  labs(
+    title    = "Median EJ Index (USA percentile): matched HBCU vs PWI",
+    subtitle = "Bootstrapped 95% CIs | dashed = 50th | dotted red = 80th percentile",
+    x = "USA percentile", y = NULL
+  )
+```
+
+------------------------------------------------------------------------
+
+# 10 Geographic Distribution
+
+```{r map-institutions, fig.height=7}
+library(sf)
+library(tigris)
+
+hbcu_coords <- readr::read_csv("hbcu_list.csv", show_col_types = FALSE) |>
+  select(school, Latitude, Longitude)
+pwi_coords  <- readr::read_csv("pwi_list.csv",  show_col_types = FALSE) |>
+  select(school, Latitude, Longitude)
+
+all_institutions <- bind_rows(
+  hbcu_scores |> select(school, burden_score, group) |>
+    left_join(hbcu_coords, by = "school"),
+  pwi_scores  |> select(school, burden_score, group) |>
+    left_join(pwi_coords,  by = "school")
+) |>
+  filter(!is.na(Latitude), !is.na(Longitude)) |>
+  mutate(group = factor(group, levels = c("HBCU", "PWI")))
+
+states_sf <- tigris::states(cb = TRUE, resolution = "20m",
+                            progress_bar = FALSE) |>
+  filter(!STUSPS %in% c("AK","HI","PR","GU","VI","MP","AS")) |>
+  sf::st_transform(4326)
+
+ggplot() +
+  geom_sf(data = states_sf, fill = "grey96", colour = "grey70",
+          linewidth = 0.3) +
+  geom_point(
+    data  = filter(all_institutions, !is.na(Longitude)),
+    aes(x = Longitude, y = Latitude, colour = group, size = burden_score),
+    alpha = 0.75
+  ) +
+  scale_colour_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"),
+    name   = "Institution type"
+  ) +
+  scale_size_continuous(range = c(1.5, 5), name = "EJ burden\nscore") +
+  coord_sf(xlim = c(-107, -67), ylim = c(24, 48)) +
+  labs(
+    title    = "Geographic distribution of HBCU and PWI institutions",
+    subtitle = "Point size proportional to cumulative EJ burden score",
+    x = NULL, y = NULL
+  ) +
+  guides(
+    colour = guide_legend(override.aes = list(size = 4)),
+    size   = guide_legend(override.aes = list(colour = "grey40"))
+  ) +
+  theme(
+    axis.text        = element_blank(),
+    axis.ticks       = element_blank(),
+    panel.grid.major = element_line(colour = "grey90")
+  )
+```
+
+```{r leaflet-map}
+pal <- colorFactor(
+  palette = c("#B2182B", "#4E79A7"),
+  domain  = all_institutions$group
+)
+
+leaflet(all_institutions) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addCircleMarkers(
+    lng         = ~Longitude,
+    lat         = ~Latitude,
+    radius      = ~ scales::rescale(burden_score, to = c(4, 12)),
+    color       = ~ pal(group),
+    fillColor   = ~ pal(group),
+    fillOpacity = 0.8,
+    stroke      = TRUE,
+    weight      = 1,
+    opacity     = 0.9,
+    popup       = ~ paste0(
+      "<b>", school, "</b><br>",
+      "Type: <b>", group, "</b><br>",
+      "EJ burden score: <b>", round(burden_score, 1), "</b>"
+    )
+  ) |>
+  addLegend(
+    pal = pal, values = ~group,
+    title = "Institution type", position = "bottomright"
+  )
+```
+
+------------------------------------------------------------------------
+
+# 11 Within-Group Variability
+
+## 11.1 Variance and IQR
+
+```{r variance-table}
+combined |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  group_by(group, indicator) |>
+  summarise(
+    SD  = round(sd(value,   na.rm = TRUE), 1),
+    IQR = round(IQR(value,  na.rm = TRUE), 1),
+    CV  = round(sd(value,   na.rm = TRUE) /
+                mean(value, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) |>
+  mutate(indicator = recode(indicator, !!!indicator_labels)) |>
+  pivot_wider(
+    names_from  = group,
+    values_from = c(SD, IQR, CV),
+    names_glue  = "{group}_{.value}"
+  ) |>
+  arrange(desc(HBCU_IQR)) |>
+  gt() |>
+  tab_header(
+    title    = "Within-group variability in EJ Index USA percentiles",
+    subtitle = "SD = standard deviation | IQR = interquartile range | CV = coefficient of variation (%)"
+  ) |>
+  tab_spanner(label = "HBCU", columns = starts_with("HBCU")) |>
+  tab_spanner(label = "PWI",  columns = starts_with("PWI"))  |>
+  cols_label(
+    indicator = "Indicator",
+    HBCU_SD = "SD", HBCU_IQR = "IQR", HBCU_CV = "CV",
+    PWI_SD  = "SD", PWI_IQR  = "IQR", PWI_CV  = "CV"
+  )
+```
+
+## 11.2 Levene's test
+
+```{r levene-tests}
+library(car)
+
+levene_res <- map_dfr(pu_vars, function(v) {
+  df <- combined |>
+    select(group, value = all_of(v)) |>
+    filter(!is.na(value))
+  lt <- leveneTest(value ~ factor(group), data = df, center = median)
+  tibble(
+    indicator = v,
+    F_stat    = round(lt$`F value`[1], 3),
+    p         = round(lt$`Pr(>F)`[1], 4)
+  )
+}) |>
+  mutate(
+    sig = case_when(
+      p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "ns"
+    ),
+    indicator = recode(indicator, !!!indicator_labels),
+    more_variable = if_else(
+      p < 0.05,
+      combined |>
+        select(group, all_of(pu_vars)) |>
+        pivot_longer(-group, names_to = "ind") |>
+        group_by(group, ind) |>
+        summarise(sd = sd(value, na.rm = TRUE), .groups = "drop") |>
+        pivot_wider(names_from = group, values_from = sd) |>
+        mutate(more = if_else(HBCU > PWI, "HBCU", "PWI")) |>
+        pull(more),
+      "-"
+    )
+  )
+
+levene_res |>
+  gt() |>
+  tab_header(
+    title    = "Levene’s test: equality of variance between groups",
+    subtitle = "H₀: variance is equal | centre = median"
+  ) |>
+  cols_label(
+    indicator     = "Indicator",
+    F_stat        = "F",
+    p             = "p-value",
+    sig           = "",
+    more_variable = "More variable group"
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fde0dd"),
+    locations = cells_body(rows = p < 0.05 & more_variable == "HBCU")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#dbeafe"),
+    locations = cells_body(rows = p < 0.05 & more_variable == "PWI")
+  )
+```
+
+## 11.3 Ridgeline distribution plot
+
+```{r ridgeline, fig.height=5}
+library(ggridges)
+
+combined |>
+  select(group, all_of(pu_vars)) |>
+  pivot_longer(-group, names_to = "indicator") |>
+  mutate(
+    indicator = recode(indicator, !!!indicator_labels),
+    group     = factor(group, levels = c("PWI", "HBCU"))
+  ) |>
+  ggplot(aes(x = value, y = indicator, fill = group)) +
+  geom_density_ridges(
+    alpha = 0.55, scale = 0.9, rel_min_height = 0.01,
+    colour = "white", linewidth = 0.3
+  ) +
+  geom_vline(xintercept = 50, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 80, linetype = "dotted", colour = "#E15759") +
+  scale_fill_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), name = NULL
+  ) +
+  scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 25)) +
+  labs(
+    title    = "EJ burden distribution by indicator: HBCU vs PWI",
+    subtitle = "Dashed = national median (50) | dotted red = EPA threshold (80)",
+    x = "USA percentile", y = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+------------------------------------------------------------------------
+
+# 12 Regional Comparison
+
+```{r regional-comparison, fig.height=6}
+region_sum <- combined |>
+  filter(!is.na(region)) |>
+  group_by(region, group) |>
+  summarise(
+    n      = n(),
+    Median = round(median(burden_score, na.rm = TRUE), 1),
+    Mean   = round(mean(burden_score,   na.rm = TRUE), 1),
+    SD     = round(sd(burden_score,     na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+region_sum |>
+  gt() |>
+  tab_header(
+    title    = "Cumulative EJ burden score by region and institution type",
+    subtitle = "Mean of 13 EJ Summary Index USA percentiles"
+  ) |>
+  cols_label(
+    region = "Region", group = "Type", n = "N",
+    Median = "Median", Mean = "Mean", SD = "SD"
+  )
+```
+
+```{r regional-violin, fig.height=6}
+combined |>
+  filter(!is.na(region)) |>
+  mutate(
+    group  = factor(group,  levels = c("HBCU", "PWI")),
+    region = factor(region, levels = c("South", "Northeast",
+                                       "Midwest", "West", "Other"))
+  ) |>
+  ggplot(aes(x = group, y = burden_score, fill = group)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.2, outlier.size = 1) +
+  geom_hline(yintercept = 50, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~region, nrow = 1) +
+  scale_fill_manual(
+    values = c("HBCU" = "#B2182B", "PWI" = "#4E79A7"), guide = "none"
+  ) +
+  labs(
+    title    = "Cumulative EJ burden score by Census region",
+    subtitle = "HBCU vs PWI within each region | dashed = national median",
+    x = NULL, y = "EJ burden score"
+  )
+```
+
+```{r regional-wilcox}
+regional_tests <- combined |>
+  filter(!is.na(region)) |>
+  group_by(region) |>
+  filter(n_distinct(group) == 2) |>
+  summarise(
+    n_hbcu   = sum(group == "HBCU"),
+    n_pwi    = sum(group == "PWI"),
+    med_hbcu = round(median(burden_score[group == "HBCU"], na.rm = TRUE), 1),
+    med_pwi  = round(median(burden_score[group == "PWI"],  na.rm = TRUE), 1),
+    diff     = round(med_hbcu - med_pwi, 1),
+    W        = wilcox.test(burden_score[group == "HBCU"],
+                           burden_score[group == "PWI"])$statistic,
+    p        = round(wilcox.test(burden_score[group == "HBCU"],
+                                 burden_score[group == "PWI"])$p.value, 4),
+    .groups  = "drop"
+  ) |>
+  mutate(sig = case_when(
+    p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "ns"
+  ))
+
+regional_tests |>
+  gt() |>
+  tab_header(
+    title    = "Within-region Wilcoxon tests: HBCU vs PWI burden score",
+    subtitle = "Positive diff = HBCU burden > PWI burden"
+  ) |>
+  cols_label(
+    region   = "Region",
+    n_hbcu   = "N (HBCU)", n_pwi  = "N (PWI)",
+    med_hbcu = "HBCU Median", med_pwi = "PWI Median",
+    diff     = "Difference", W = "W", p = "p-value", sig = ""
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fde0dd"),
+    locations = cells_body(rows = p < 0.05)
+  )
+```
+
+------------------------------------------------------------------------
+
+# 13 Effect Sizes
+
+Three complementary effect size measures: **Cohen's d** (standardised mean difference); **rank-biserial correlation r** (non-parametric, derived from Wilcoxon W); **Common Language Effect Size (CLES)** — the probability that a randomly selected HBCU community exceeds a randomly selected PWI community.
+
+```{r effect-sizes}
+cohens_d <- function(x, y) {
+  n1 <- sum(!is.na(x)); n2 <- sum(!is.na(y))
+  sp <- sqrt(((n1-1)*var(x, na.rm=TRUE) + (n2-1)*var(y, na.rm=TRUE)) /
+               (n1 + n2 - 2))
+  (mean(x, na.rm=TRUE) - mean(y, na.rm=TRUE)) / sp
+}
+rb_corr <- function(W, n1, n2) 1 - (2 * W) / (n1 * n2)
+cles    <- function(x, y) mean(outer(x, y, ">"), na.rm = TRUE)
+
+effect_df <- map_dfr(pu_vars, function(v) {
+  hv <- hbcu_scores[[v]]; pv <- pwi_scores[[v]]
+  wt <- wilcox.test(hv, pv, na.action = na.omit)
+  n1 <- sum(!is.na(hv)); n2 <- sum(!is.na(pv))
+  tibble(
+    indicator = v,
+    d    = round(cohens_d(hv, pv), 3),
+    r    = round(rb_corr(wt$statistic, n1, n2), 3),
+    CLES = round(cles(na.omit(hv), na.omit(pv)) * 100, 1)
+  )
+}) |>
+  mutate(
+    indicator = recode(indicator, !!!indicator_labels),
+    d_label = case_when(
+      abs(d) >= 0.8 ~ "Large", abs(d) >= 0.5 ~ "Medium",
+      abs(d) >= 0.2 ~ "Small", TRUE ~ "Negligible"
+    ),
+    r_label = case_when(
+      abs(r) >= 0.5 ~ "Large", abs(r) >= 0.3 ~ "Medium",
+      abs(r) >= 0.1 ~ "Small", TRUE ~ "Negligible"
+    )
+  ) |>
+  arrange(desc(abs(d)))
+
+effect_df |>
+  gt() |>
+  tab_header(
+    title    = "Effect sizes: HBCU vs PWI EJ burden per indicator",
+    subtitle = "Positive d and r indicate HBCU communities are more burdened"
+  ) |>
+  cols_label(
+    indicator = "Indicator",
+    d = "Cohen’s d", d_label = "d magnitude",
+    r = "Rank-biserial r", r_label = "r magnitude",
+    CLES = "CLES (%)"
+  ) |>
+  tab_footnote(
+    footnote  = "CLES = P(HBCU community > PWI community on this indicator).",
+    locations = cells_column_labels(columns = CLES)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fde0dd"),
+    locations = cells_body(
+      columns = d_label,
+      rows    = d_label %in% c("Large", "Medium")
+    )
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fde0dd"),
+    locations = cells_body(columns = CLES, rows = CLES > 65)
+  )
+```
+
+```{r effect-dotplot, fig.height=6}
+effect_df |>
+  ggplot(aes(x = r, y = reorder(indicator, r))) +
+  geom_vline(xintercept = 0,   colour = "grey50",  linewidth = 0.6) +
+  geom_vline(xintercept = 0.3, linetype = "dashed",
+             colour = "grey60", linewidth = 0.4) +
+  geom_vline(xintercept = 0.5, linetype = "dotted",
+             colour = "#E15759", linewidth = 0.5) +
+  geom_segment(aes(xend = 0, yend = indicator), colour = "grey80") +
+  geom_point(aes(colour = r), size = 4) +
+  scale_colour_gradient2(
+    low      = "#4E79A7", mid = "grey80", high = "#B2182B",
+    midpoint = 0, name = "Rank-biserial r"
+  ) +
+  scale_x_continuous(limits = c(-0.1, 1), breaks = seq(0, 1, 0.25)) +
+  labs(
+    title    = "Rank-biserial effect size: HBCU vs PWI per indicator",
+    subtitle = "Dashed = medium (0.3) | dotted = large (0.5) | positive = HBCU more burdened",
+    x = "Rank-biserial correlation (r)", y = NULL
+  )
+```
+
+------------------------------------------------------------------------
+
+# 14 Save Outputs
+
+```{r save-outputs}
+# Save the matched dataset for the Dryad repository
+write_csv(matched, "matched_hbcu_pwi.csv")
+
+# Session information for full reproducibility record
+sessionInfo()
+```

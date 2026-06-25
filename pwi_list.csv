@@ -1,0 +1,87 @@
+school,Latitude,Longitude,Location,year_founded
+University of Alabama,33.2148,-87.5406,"Tuscaloosa, AL",1831
+Auburn University,32.6099,-85.4808,"Auburn, AL",1856
+Jacksonville State University,33.8226,-85.7621,"Jacksonville, AL",1883
+Troy University,31.7902,-85.9629,"Troy, AL",1887
+University of South Alabama,30.6936,-88.0472,"Mobile, AL",1963
+University of Montevallo,33.1012,-86.8630,"Montevallo, AL",1896
+University of North Alabama,34.7998,-87.6773,"Florence, AL",1830
+University of Arkansas,36.0679,-94.1741,"Fayetteville, AR",1871
+Arkansas State University,35.8426,-90.6975,"Jonesboro, AR",1909
+University of Central Arkansas,35.0842,-92.4382,"Conway, AR",1907
+University of Florida,29.6436,-82.3549,"Gainesville, FL",1853
+Florida State University,30.4418,-84.2985,"Tallahassee, FL",1851
+University of South Florida,27.9883,-82.3018,"Tampa, FL",1956
+University of Central Florida,28.6024,-81.2001,"Orlando, FL",1963
+Florida Atlantic University,26.3716,-80.1023,"Boca Raton, FL",1961
+University of West Florida,30.5395,-87.2187,"Pensacola, FL",1963
+University of Georgia,33.9480,-83.3776,"Athens, GA",1785
+Georgia Institute of Technology,33.7756,-84.3963,"Atlanta, GA",1885
+Georgia State University,33.7500,-84.3880,"Atlanta, GA",1913
+Georgia Southern University,32.4224,-81.7851,"Statesboro, GA",1906
+Kennesaw State University,34.0234,-84.5818,"Kennesaw, GA",1963
+Augusta University,33.4736,-82.0105,"Augusta, GA",1828
+University of Kentucky,38.0308,-84.5037,"Lexington, KY",1865
+Western Kentucky University,36.9685,-86.4808,"Bowling Green, KY",1906
+Eastern Kentucky University,37.7398,-84.2947,"Richmond, KY",1906
+Murray State University,36.6100,-88.3139,"Murray, KY",1922
+Morehead State University,38.1851,-83.4324,"Morehead, KY",1922
+Louisiana State University,30.4133,-91.1800,"Baton Rouge, LA",1853
+University of Louisiana at Lafayette,30.2138,-92.0201,"Lafayette, LA",1898
+University of Louisiana at Monroe,32.5277,-92.0738,"Monroe, LA",1931
+Northwestern State University,31.7551,-93.1013,"Natchitoches, LA",1884
+McNeese State University,30.2266,-93.2138,"Lake Charles, LA",1939
+Nicholls State University,29.5959,-90.8025,"Thibodaux, LA",1948
+Southeastern Louisiana University,30.5079,-90.4715,"Hammond, LA",1925
+University of Maryland,38.9869,-76.9426,"College Park, MD",1856
+Towson University,39.3958,-76.6047,"Towson, MD",1866
+University of Mississippi,34.3654,-89.5392,"Oxford, MS",1848
+Mississippi State University,33.4562,-88.7928,"Starkville, MS",1878
+University of Southern Mississippi,31.3280,-89.3361,"Hattiesburg, MS",1910
+Delta State University,33.7434,-90.7232,"Cleveland, MS",1924
+University of Missouri,38.9517,-92.3341,"Columbia, MO",1839
+Missouri State University,37.1957,-93.2788,"Springfield, MO",1905
+University of North Carolina at Chapel Hill,35.9049,-79.0469,"Chapel Hill, NC",1789
+North Carolina State University,35.7848,-78.6820,"Raleigh, NC",1887
+East Carolina University,35.6052,-77.3664,"Greenville, NC",1907
+Appalachian State University,36.2168,-81.6746,"Boone, NC",1899
+University of North Carolina at Charlotte,35.3075,-80.7323,"Charlotte, NC",1946
+University of North Carolina at Wilmington,34.2285,-77.8705,"Wilmington, NC",1947
+University of Oklahoma,35.2059,-97.4451,"Norman, OK",1890
+Oklahoma State University,36.1267,-97.0691,"Stillwater, OK",1890
+University of South Carolina,33.9965,-81.0299,"Columbia, SC",1801
+Clemson University,34.6834,-82.8374,"Clemson, SC",1889
+Winthrop University,34.9287,-81.0287,"Rock Hill, SC",1886
+College of Charleston,32.7815,-79.9381,"Charleston, SC",1770
+Coastal Carolina University,33.7951,-79.0130,"Conway, SC",1954
+Francis Marion University,34.2091,-79.7978,"Florence, SC",1970
+University of Tennessee,35.9544,-83.9289,"Knoxville, TN",1794
+Middle Tennessee State University,35.8456,-86.3678,"Murfreesboro, TN",1911
+University of Memphis,35.1188,-89.9376,"Memphis, TN",1912
+Tennessee Tech University,36.1628,-85.5016,"Cookeville, TN",1915
+Austin Peay State University,36.5309,-87.3598,"Clarksville, TN",1927
+University of Texas at Austin,30.2849,-97.7341,"Austin, TX",1883
+Texas A&M University,30.6280,-96.3344,"College Station, TX",1876
+Texas Tech University,33.5843,-101.8783,"Lubbock, TX",1923
+Sam Houston State University,30.7138,-95.5472,"Huntsville, TX",1879
+Stephen F. Austin State University,31.6026,-94.6553,"Nacogdoches, TX",1923
+Lamar University,30.0850,-94.1378,"Beaumont, TX",1923
+University of North Texas,33.2072,-97.1526,"Denton, TX",1890
+Texas State University,29.8897,-97.9403,"San Marcos, TX",1899
+University of Virginia,38.0336,-78.5080,"Charlottesville, VA",1819
+Virginia Polytechnic Institute and State University,37.2284,-80.4234,"Blacksburg, VA",1872
+Virginia Commonwealth University,37.5477,-77.4520,"Richmond, VA",1838
+Old Dominion University,36.8855,-76.3062,"Norfolk, VA",1930
+James Madison University,38.4354,-78.8692,"Harrisonburg, VA",1908
+George Mason University,38.8303,-77.3076,"Fairfax, VA",1949
+West Virginia University,39.6356,-79.9547,"Morgantown, WV",1867
+Rutgers University,40.5008,-74.4474,"New Brunswick, NJ",1766
+Temple University,39.9812,-75.1551,"Philadelphia, PA",1884
+Pennsylvania State University,40.7982,-77.8599,"University Park, PA",1855
+University of Cincinnati,39.1329,-84.5150,"Cincinnati, OH",1819
+Ohio State University,40.0067,-83.0305,"Columbus, OH",1870
+Wayne State University,42.3576,-83.0716,"Detroit, MI",1868
+University of Illinois at Chicago,41.8709,-87.6498,"Chicago, IL",1946
+Kansas State University,39.1836,-96.5717,"Manhattan, KS",1863
+University of Nebraska-Lincoln,40.8202,-96.7005,"Lincoln, NE",1869
+Arizona State University,33.4255,-111.9400,"Tempe, AZ",1885
